@@ -2,6 +2,12 @@
 
 这是根据需求答卷制作的 Windows 单机离线首版。它不联网，不开具具有法律效力的医疗收费票据，只生成内部收费或治疗清单。
 
+## 直接下载 Windows 版
+
+[下载最新 Windows x64 离线包](https://github.com/Misakakuroko/clinic-charge-desktop/releases/latest/download/ClinicCharge-Windows-x64.zip)
+
+下载后请完整解压，再双击文件夹内的 `ClinicCharge.exe`。不要只把 EXE 单独复制出来。
+
 首版闭环：
 
 - 维护收费项目目录，也允许本单临时项目；
