@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; font-src 'self'; object-src 'none'; media-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'" />
+    <title>门诊收费台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <div class="brand-block">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <div>
+            <p>内部工作台</p>
+            <strong>门诊收费台</strong>
+          </div>
+        </div>
+
+        <nav class="nav-stack">
+          <button class="nav-item is-active" type="button" data-view="billing">
+            <span class="nav-index">01</span><span>收费开单</span><kbd>F2</kbd>
+          </button>
+          <button class="nav-item" type="button" data-view="history">
+            <span class="nav-index">02</span><span>历史单据</span><kbd>F3</kbd>
+          </button>
+          <button class="nav-item" type="button" data-view="catalog">
+            <span class="nav-index">03</span><span>项目目录</span><kbd>F4</kbd>
+          </button>
+          <button class="nav-item" type="button" data-view="printing">
+            <span class="nav-index">04</span><span>打印设置</span><kbd>F5</kbd>
+          </button>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="machine-status">
+            <span class="status-lamp" aria-hidden="true"></span>
+            <div><strong>本机数据可用</strong><small id="storage-mode">正在连接…</small></div>
+          </div>
+          <div class="shift-card">
+            <span>当前操作员</span>
+            <strong id="sidebar-operator">收费员</strong>
+            <time id="sidebar-clock"></time>
+          </div>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow"><span>门诊内部清单</span><span>/</span><span id="page-code">BILLING 01</span></div>
+            <h1 id="page-title">收费开单</h1>
+            <p id="page-subtitle">录入项目、核对金额并打印内部明细清单</p>
+          </div>
+          <div class="topbar-meta">
+            <div><span>工作日</span><strong id="today-label">—</strong></div>
+            <div><span>数据状态</span><strong id="save-state">已同步</strong></div>
+          </div>
+        </header>
+
+        <section class="view is-visible" id="view-billing" data-view-panel="billing" aria-labelledby="page-title">
+          <div class="action-strip">
+            <div class="action-group">
+              <button class="button button-dark" id="new-document" type="button"><span class="key-cap">N</span> 新建清单</button>
+              <button class="button" id="save-draft" type="button">保存草稿</button>
+            </div>
+            <div class="action-group">
+              <label class="compact-select">打印档案
+                <select id="billing-profile"></select>
+              </label>
+              <button class="button" id="preview-document" type="button">打印预览</button>
+              <button class="button button-accent" id="confirm-document" type="button">确认并锁定</button>
+            </div>
+          </div>
+
+          <div class="billing-grid">
+            <article class="paper-editor">
+              <div class="paper-edge" aria-hidden="true"></div>
+              <header class="document-heading">
+                <div>
+                  <span class="document-kicker">INTERNAL CHARGE LIST</span>
+                  <h2>门诊项目明细清单</h2>
+                  <p>仅作内部收费及治疗记录，不作为报销凭证</p>
+                </div>
+                <div class="document-stamp">
+                  <span id="document-status" class="status-badge status-draft">草稿</span>
+                  <strong id="document-serial">待确认后生成</strong>
+                </div>
+              </header>
+
+              <fieldset class="heading-form" id="heading-fields">
+                <legend class="sr-only">清单抬头</legend>
+                <label><span>姓名 <b>*</b></span><input id="patient-name" maxlength="30" autocomplete="off" placeholder="输入姓名" /></label>
+                <label><span>收费日期 <b>*</b></span><input id="charge-date" type="date" /></label>
+                <label><span>病人类型</span>
+                  <select id="patient-type"><option>自费</option><option>其他</option></select>
+                </label>
+                <label><span>开具人员</span><input id="operator-name" maxlength="20" value="收费员" /></label>
+                <label><span>医疗机构</span><input id="medical-institution" maxlength="50" placeholder="输入机构名称" /></label>
+                <label><span>开具医生</span><input id="doctor-name" maxlength="20" placeholder="输入医生姓名" /></label>
+                <label><span>统计开始日期</span><input id="statistics-from" type="date" /></label>
+                <label><span>统计结束日期</span><input id="statistics-to" type="date" /></label>
+              </fieldset>
+
+              <div class="line-toolbar">
+                <div><strong>收费项目</strong><span id="line-count">0 项</span></div>
+                <div>
+                  <button class="text-button" id="add-catalog-line" type="button">＋ 从目录添加</button>
+                  <button class="text-button" id="add-temp-line" type="button">＋ 临时项目</button>
+                </div>
+              </div>
+
+              <div class="table-wrap billing-table-wrap">
+                <table class="data-table line-table">
+                  <thead><tr><th class="col-num">序</th><th>项目名称及规格</th><th>单价</th><th>数量</th><th>单位</th><th>金额</th><th class="col-action"><span class="sr-only">操作</span></th></tr></thead>
+                  <tbody id="line-items"></tbody>
+                </table>
+                <div class="empty-state" id="lines-empty">
+                  <span class="empty-ruler" aria-hidden="true"></span>
+                  <strong>还没有收费项目</strong>
+                  <p>从右侧目录选择常用项目，或直接新增临时项目。</p>
+                </div>
+              </div>
+
+              <div class="document-footer">
+                <label class="note-field"><span>内部备注</span><textarea id="document-note" rows="2" maxlength="120" placeholder="选填；不会突出显示在清单上"></textarea></label>
+                <div class="totals-block">
+                  <div><span>合计金额</span><strong id="total-amount">¥0.00</strong></div>
+                  <p>人民币（大写）：<b id="total-uppercase">零元整</b></p>
+                </div>
+              </div>
+              <div class="locked-mask" id="locked-mask" hidden>
+                <strong>本清单已锁定</strong><span>如需修改，请在历史单据中“作废重开”</span>
+              </div>
+            </article>
+
+            <aside class="catalog-palette" aria-label="项目快捷目录">
+              <div class="palette-heading">
+                <div><span>项目目录</span><strong>快捷录入</strong></div>
+                <span class="count-chip" id="active-catalog-count">0</span>
+              </div>
+              <label class="search-box"><span aria-hidden="true">⌕</span><input id="palette-search" type="search" placeholder="搜索名称或编码" autocomplete="off" /></label>
+              <div class="palette-list" id="palette-list"></div>
+              <button class="palette-manage" type="button" data-go-view="catalog">管理完整项目目录 →</button>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-history" data-view-panel="history" aria-labelledby="history-heading">
+          <div class="section-heading">
+            <div><span class="section-no">02</span><div><h2 id="history-heading">历史单据</h2><p>姓名、日期与内部流水号可任意组合查询</p></div></div>
+            <span class="record-counter" id="history-count">0 条记录</span>
+          </div>
+          <form class="filter-panel" id="history-filter">
+            <label class="field-wide"><span>姓名（模糊）</span><input id="filter-name" placeholder="例如：王" autocomplete="off" /></label>
+            <label><span>开始日期</span><input id="filter-from" type="date" /></label>
+            <label><span>结束日期</span><input id="filter-to" type="date" /></label>
+            <label><span>内部流水号</span><input id="filter-serial" placeholder="输入完整或部分编号" autocomplete="off" /></label>
+            <div class="filter-actions"><button class="button button-dark" type="submit">查询</button><button class="button" id="reset-filter" type="button">重置</button></div>
+          </form>
+          <div class="panel table-panel">
+            <div class="table-wrap">
+              <table class="data-table history-table">
+                <thead><tr><th>内部流水号</th><th>收费日期</th><th>姓名</th><th>项目数</th><th>金额</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody id="history-rows"></tbody>
+              </table>
+              <div class="empty-state" id="history-empty"><strong>暂无匹配单据</strong><p>调整查询条件，或先创建并确认一张清单。</p></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-catalog" data-view-panel="catalog" aria-labelledby="catalog-heading">
+          <div class="section-heading">
+            <div><span class="section-no">03</span><div><h2 id="catalog-heading">项目目录</h2><p>维护常用收费项目；停用项目不会出现在开单快捷目录中</p></div></div>
+            <button class="button button-accent" id="create-catalog-item" type="button">＋ 新建项目</button>
+          </div>
+          <div class="catalog-summary">
+            <div><span>全部项目</span><strong id="catalog-total">0</strong></div>
+            <div><span>正在使用</span><strong id="catalog-active">0</strong></div>
+            <div><span>已经停用</span><strong id="catalog-inactive">0</strong></div>
+            <label class="search-box catalog-search"><span aria-hidden="true">⌕</span><input id="catalog-search" type="search" placeholder="筛选项目名称 / 编码" /></label>
+          </div>
+          <div class="panel table-panel">
+            <div class="table-wrap">
+              <table class="data-table catalog-table">
+                <thead><tr><th>项目编码</th><th>项目名称及规格</th><th>默认单价</th><th>单位</th><th>状态</th><th>最后更新</th><th>操作</th></tr></thead>
+                <tbody id="catalog-rows"></tbody>
+              </table>
+              <div class="empty-state" id="catalog-empty"><strong>目录为空</strong><p>点击“新建项目”录入第一个常用收费项目。</p></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-printing" data-view-panel="printing" aria-labelledby="printing-heading">
+          <div class="section-heading">
+            <div><span class="section-no">04</span><div><h2 id="printing-heading">打印设置</h2><p>分别保存空白纸完整打印与预印票据套打的尺寸及校准量</p></div></div>
+            <button class="button button-dark" id="save-print-settings" type="button">保存打印设置</button>
+          </div>
+          <div class="print-note"><strong>校准原则</strong><span>X 正数向右、负数向左；Y 正数向下、负数向上。建议先用普通纸试印，再与票据透光叠放校准。</span></div>
+          <section class="local-settings" aria-labelledby="local-settings-title">
+            <div>
+              <span class="panel-kicker">LOCAL SETTINGS</span>
+              <h3 id="local-settings-title">本机默认信息与备份</h3>
+              <p>用于新建清单的默认值；备份文件为明文 JSON，请妥善保管。</p>
+            </div>
+            <label><span>默认医疗机构</span><input id="settings-organization" maxlength="50" placeholder="例如：某某门诊部" /></label>
+            <label><span>默认录入人员</span><input id="settings-operator" maxlength="20" placeholder="例如：收费员" /></label>
+            <div class="backup-actions">
+              <button class="button" id="import-backup" type="button">导入备份</button>
+              <button class="button" id="export-backup" type="button">导出备份</button>
+            </div>
+          </section>
+          <form id="print-profiles" class="profile-grid"></form>
+          <datalist id="printer-options"></datalist>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="catalog-dialog" class="modal compact-modal">
+      <form method="dialog" id="catalog-form">
+        <div class="modal-heading"><div><span>PROJECT CATALOG</span><h2 id="catalog-dialog-title">新建收费项目</h2></div><button class="icon-button" id="close-catalog-dialog" type="button" aria-label="关闭">×</button></div>
+        <input type="hidden" id="catalog-id" />
+        <div class="form-grid">
+          <label><span>项目编码 <b>*</b></span><input id="catalog-code" required maxlength="20" autocomplete="off" /></label>
+          <label><span>单位 <b>*</b></span><input id="catalog-unit" required maxlength="8" placeholder="次 / 盒 / 贴" /></label>
+          <label class="span-2"><span>项目名称 <b>*</b></span><input id="catalog-name" required maxlength="60" autocomplete="off" /></label>
+          <label class="span-2"><span>规格</span><input id="catalog-specification" maxlength="60" placeholder="例如：10片 / 盒、每次治疗" autocomplete="off" /></label>
+          <label><span>默认单价（元） <b>*</b></span><input id="catalog-price" required inputmode="decimal" placeholder="0.00" /></label>
+          <label><span>项目类别</span><input id="catalog-category" maxlength="30" placeholder="例如：治疗、药品、检查" /></label>
+          <label class="span-2"><span>票据汇总类别</span><input id="catalog-summary-category" maxlength="30" placeholder="例如：治疗费、西药费、检查费" /></label>
+          <label class="toggle-field"><span>目录状态</span><input id="catalog-enabled" type="checkbox" checked /><i aria-hidden="true"></i><strong>启用</strong></label>
+        </div>
+        <div class="modal-actions"><button class="button" id="cancel-catalog" type="button">取消</button><button class="button button-accent" id="submit-catalog" type="submit">保存项目</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="picker-dialog" class="modal picker-modal">
+      <div class="modal-heading"><div><span>ADD FROM CATALOG</span><h2>从项目目录添加</h2></div><button class="icon-button" id="close-picker" type="button" aria-label="关闭">×</button></div>
+      <label class="search-box"><span aria-hidden="true">⌕</span><input id="picker-search" type="search" placeholder="搜索名称或编码" /></label>
+      <div class="picker-list" id="picker-list"></div>
+    </dialog>
+
+    <dialog id="history-dialog" class="modal history-modal">
+      <div class="modal-heading"><div><span>DOCUMENT RECORD</span><h2>单据详情</h2></div><button class="icon-button" id="close-history-dialog" type="button" aria-label="关闭">×</button></div>
+      <div id="history-detail"></div>
+      <div class="modal-actions history-actions" id="history-actions"></div>
+    </dialog>
+
+    <dialog id="print-dialog" class="modal print-modal">
+      <div class="print-preview-toolbar">
+        <div><span>打印预览</span><strong id="preview-profile-name">—</strong></div>
+        <div><button class="button" id="close-print-preview" type="button">关闭</button><button class="button button-accent" id="print-now" type="button">打印</button></div>
+      </div>
+      <div class="print-stage"><div class="print-sheet" id="print-sheet"></div></div>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    <div class="sr-only" id="live-region" aria-live="polite"></div>
+    <script type="module" src="./app.mjs"></script>
+  </body>
+</html>
