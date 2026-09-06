@@ -1,92 +1,40 @@
 'use strict';
 
-const { app, BrowserWindow, dialog, ipcMain, safeStorage, session } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, safeStorage, session, shell } = require('electron');
 const fs = require('node:fs/promises');
+const fsSync = require('node:fs');
 const path = require('node:path');
-const crypto = require('node:crypto');
+const os = require('node:os');
 const { fileURLToPath } = require('node:url');
+const { createStorage, PublicError, isPlainObject, sanitizeJsonObject } = require('./storage.cjs');
 
 const CHANNELS = Object.freeze({
   loadData: 'clinic:data:load',
   saveData: 'clinic:data:save',
   exportBackup: 'clinic:backup:export',
   importBackup: 'clinic:backup:import',
+  restoreBackup: 'clinic:backup:restore',
+  restorePreviousBackup: 'clinic:backup:restore-previous',
+  getStorageInfo: 'clinic:storage:info',
+  openDataFolder: 'clinic:storage:open-folder',
+  setDirty: 'clinic:window:set-dirty',
+  closeReady: 'clinic:window:close-ready',
+  closeRequest: 'clinic:window:close-request',
+  respondClose: 'clinic:window:respond-close',
   getPrinters: 'clinic:printer:list',
   print: 'clinic:printer:print',
 });
 
 const DATA_FILE_NAME = 'clinic-charge-data.json';
-const DATA_FORMAT = 'clinic-charge-data';
-const BACKUP_FORMAT = 'clinic-charge-backup';
-const FORMAT_VERSION = 1;
-const MAX_DATA_BYTES = 10 * 1024 * 1024;
-const MAX_FILE_BYTES = 16 * 1024 * 1024;
-const MAX_DEPTH = 48;
-const MAX_NODES = 150000;
-const BLOCKED_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 const SOURCE_ROOT = path.resolve(__dirname, '..', 'src');
 const ENTRY_FILE = path.join(SOURCE_ROOT, 'index.html');
 
 let mainWindow = null;
-
-class PublicError extends Error {}
-
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function sanitizeJsonObject(input) {
-  if (!isPlainObject(input)) {
-    throw new PublicError('数据必须是普通对象。');
-  }
-
-  const seen = new WeakSet();
-  let nodes = 0;
-
-  function visit(value, depth) {
-    nodes += 1;
-    if (nodes > MAX_NODES) throw new PublicError('数据项目过多，无法处理。');
-    if (depth > MAX_DEPTH) throw new PublicError('数据嵌套层级过深。');
-
-    if (value === null || typeof value === 'boolean' || typeof value === 'string') {
-      return value;
-    }
-    if (typeof value === 'number') {
-      if (!Number.isFinite(value)) throw new PublicError('数据包含无效数字。');
-      return value;
-    }
-    if (typeof value !== 'object') {
-      throw new PublicError('数据只能包含可保存的 JSON 值。');
-    }
-    if (seen.has(value)) throw new PublicError('数据不能循环引用。');
-    seen.add(value);
-
-    let result;
-    if (Array.isArray(value)) {
-      result = value.map((item) => visit(item, depth + 1));
-    } else {
-      if (!isPlainObject(value)) throw new PublicError('数据包含非普通对象。');
-      result = {};
-      for (const [key, child] of Object.entries(value)) {
-        if (BLOCKED_KEYS.has(key)) throw new PublicError('数据包含不安全的字段名。');
-        if (key.length > 256) throw new PublicError('数据字段名过长。');
-        result[key] = visit(child, depth + 1);
-      }
-    }
-
-    seen.delete(value);
-    return result;
-  }
-
-  const clean = visit(input, 0);
-  const serialized = JSON.stringify(clean);
-  if (Buffer.byteLength(serialized, 'utf8') > MAX_DATA_BYTES) {
-    throw new PublicError('数据超过 10 MB，无法保存。');
-  }
-  return { clean, serialized };
-}
+let storage = null;
+let rendererDirty = false;
+let closeReady = false;
+let closeRequested = false;
+let allowClose = false;
 
 function isPathInside(basePath, candidatePath) {
   const relative = path.relative(path.resolve(basePath), path.resolve(candidatePath));
@@ -114,122 +62,6 @@ function validateDialogJsonPath(filePath) {
   return resolved;
 }
 
-async function writeAtomic(filePath, contents) {
-  const directory = path.dirname(filePath);
-  await fs.mkdir(directory, { recursive: true });
-  const temporaryPath = path.join(
-    directory,
-    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`,
-  );
-
-  try {
-    await fs.writeFile(temporaryPath, contents, {
-      encoding: 'utf8',
-      mode: 0o600,
-      flag: 'wx',
-    });
-    await fs.rename(temporaryPath, filePath);
-  } catch (error) {
-    await fs.unlink(temporaryPath).catch(() => {});
-    throw error;
-  }
-}
-
-function currentStorageProtection() {
-  return safeStorage.isEncryptionAvailable() ? 'encrypted-v1' : 'plain-v1';
-}
-
-async function saveLocalData(input) {
-  const { clean, serialized } = sanitizeJsonObject(input);
-  const storageProtection = currentStorageProtection();
-  let envelope;
-
-  if (storageProtection === 'encrypted-v1') {
-    envelope = {
-      format: DATA_FORMAT,
-      version: FORMAT_VERSION,
-      storageProtection,
-      payload: safeStorage.encryptString(serialized).toString('base64'),
-    };
-  } else {
-    envelope = {
-      format: DATA_FORMAT,
-      version: FORMAT_VERSION,
-      storageProtection,
-      data: clean,
-    };
-  }
-
-  await writeAtomic(getDataPath(), `${JSON.stringify(envelope, null, 2)}\n`);
-  return { ok: true, storageProtection };
-}
-
-async function readRegularJsonFile(filePath) {
-  let stats;
-  try {
-    stats = await fs.lstat(filePath);
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return null;
-    throw error;
-  }
-  if (!stats.isFile() || stats.isSymbolicLink()) {
-    throw new PublicError('所选路径不是可读取的普通文件。');
-  }
-  if (stats.size > MAX_FILE_BYTES) throw new PublicError('文件过大，无法读取。');
-  const text = await fs.readFile(filePath, 'utf8');
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new PublicError('文件不是有效的 JSON 数据。');
-  }
-}
-
-async function loadLocalData() {
-  const stored = await readRegularJsonFile(getDataPath());
-  if (stored === null) {
-    return { data: null, storageProtection: currentStorageProtection() };
-  }
-
-  if (isPlainObject(stored) && stored.format === DATA_FORMAT && stored.version === FORMAT_VERSION) {
-    if (stored.storageProtection === 'encrypted-v1') {
-      if (!safeStorage.isEncryptionAvailable()) {
-        throw new PublicError('系统安全存储当前不可用，无法解密本地数据。');
-      }
-      if (typeof stored.payload !== 'string' || stored.payload.length > MAX_FILE_BYTES * 2) {
-        throw new PublicError('本地加密数据格式无效。');
-      }
-      let decrypted;
-      try {
-        decrypted = safeStorage.decryptString(Buffer.from(stored.payload, 'base64'));
-      } catch {
-        throw new PublicError('本地数据无法解密，可能来自另一台电脑或已经损坏。');
-      }
-      let parsed;
-      try {
-        parsed = JSON.parse(decrypted);
-      } catch {
-        throw new PublicError('解密后的本地数据格式无效。');
-      }
-      return { data: sanitizeJsonObject(parsed).clean, storageProtection: 'encrypted-v1' };
-    }
-
-    if (stored.storageProtection === 'plain-v1') {
-      return { data: sanitizeJsonObject(stored.data).clean, storageProtection: 'plain-v1' };
-    }
-    throw new PublicError('本地数据使用了不支持的存储格式。');
-  }
-
-  // 兼容最早期直接写入对象的本地数据。
-  return { data: sanitizeJsonObject(stored).clean, storageProtection: 'plain-v1' };
-}
-
-function extractBackupData(parsed) {
-  if (isPlainObject(parsed) && parsed.format === BACKUP_FORMAT) {
-    if (parsed.version !== FORMAT_VERSION) throw new PublicError('备份版本暂不支持。');
-    return sanitizeJsonObject(parsed.data).clean;
-  }
-  return sanitizeJsonObject(parsed).clean;
-}
 
 function rendererUrlIsTrusted(urlString) {
   try {
@@ -304,17 +136,45 @@ function buildPrintOptions(rawInput) {
 }
 
 function registerIpcHandlers() {
-  registerHandler(CHANNELS.loadData, '读取本地数据失败。', async () => loadLocalData());
-  registerHandler(CHANNELS.saveData, '保存本地数据失败。', async (_event, data) => saveLocalData(data));
+  registerHandler(CHANNELS.loadData, '读取本地数据失败。', async () => storage.loadData());
+  registerHandler(CHANNELS.saveData, '保存本地数据失败。', async (_event, data) => storage.saveData(data));
+  registerHandler(CHANNELS.restoreBackup, '恢复备份失败，原数据已保留。', async (_event, data) => storage.restoreBackup(data));
+  registerHandler(CHANNELS.restorePreviousBackup, '恢复自动备份失败，原数据已保留。', async () => storage.restorePreviousBackup());
+  registerHandler(CHANNELS.getStorageInfo, '读取数据位置失败。', async () => storage.getStorageInfo());
+  registerHandler(CHANNELS.openDataFolder, '打开数据目录失败。', async () => {
+    const directory = path.dirname(getDataPath());
+    await fs.mkdir(directory, { recursive: true });
+    const error = await shell.openPath(directory);
+    if (error) throw new PublicError('打开数据目录失败，请通过系统文件管理器访问。');
+    return { ok: true };
+  });
+  registerHandler(CHANNELS.setDirty, '更新编辑状态失败。', async (_event, dirty) => {
+    rendererDirty = dirty === true;
+    return { ok: true };
+  });
+  registerHandler(CHANNELS.closeReady, '初始化关闭保护失败。', async () => {
+    closeReady = true;
+    return { ok: true };
+  });
+  registerHandler(CHANNELS.respondClose, '关闭软件失败。', async (_event, response) => {
+    if (!closeRequested) return { ok: false };
+    if (response?.action === 'cancel') {
+      closeRequested = false;
+      return { ok: true };
+    }
+    if (response?.action !== 'close') throw new PublicError('关闭操作无效。');
+    await finishClose();
+    return { ok: true };
+  });
 
   registerHandler(CHANNELS.exportBackup, '导出备份失败。', async (_event, suppliedData) => {
     let data;
     if (suppliedData === undefined) {
-      const loaded = await loadLocalData();
+      const loaded = await storage.loadData();
       if (loaded.data === null) throw new PublicError('当前没有可导出的数据。');
       data = loaded.data;
     } else {
-      data = sanitizeJsonObject(suppliedData).clean;
+      data = await storage.checkedStore(suppliedData);
     }
 
     const result = await dialog.showSaveDialog(mainWindow, {
@@ -328,13 +188,7 @@ function registerIpcHandlers() {
     }
 
     const exportPath = validateDialogJsonPath(result.filePath);
-    const backup = {
-      format: BACKUP_FORMAT,
-      version: FORMAT_VERSION,
-      exportedAt: new Date().toISOString(),
-      data,
-    };
-    await writeAtomic(exportPath, `${JSON.stringify(backup, null, 2)}\n`);
+    await storage.exportBackup(exportPath, data);
     return {
       ok: true,
       canceled: false,
@@ -355,13 +209,13 @@ function registerIpcHandlers() {
     }
 
     const importPath = validateDialogJsonPath(result.filePaths[0]);
-    const parsed = await readRegularJsonFile(importPath);
+    const parsed = await storage.readRegularJsonFile(importPath);
     if (parsed === null) throw new PublicError('备份文件不存在。');
     return {
       ok: true,
       canceled: false,
       filePath: importPath,
-      data: extractBackupData(parsed),
+      data: await storage.extractBackupData(parsed),
       backupProtection: 'plain-json',
       containsPlaintext: true,
     };
@@ -387,6 +241,12 @@ function registerIpcHandlers() {
       });
     });
   });
+}
+
+async function finishClose() {
+  await storage.whenIdle();
+  allowClose = true;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
 }
 
 function hardenSession() {
@@ -427,15 +287,55 @@ function createWindow() {
   mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
     if (!rendererUrlIsTrusted(targetUrl)) event.preventDefault();
   });
+  mainWindow.webContents.on('render-process-gone', () => {
+    closeReady = false;
+    closeRequested = false;
+  });
+  mainWindow.on('close', (event) => {
+    if (allowClose) return;
+    event.preventDefault();
+    if (closeRequested) return;
+    closeRequested = true;
+    if (closeReady) {
+      mainWindow.webContents.send(CHANNELS.closeRequest, { dirty: rendererDirty });
+    } else {
+      finishClose().catch((error) => {
+        closeRequested = false;
+        console.error('[window:close]', error);
+      });
+    }
+  });
   mainWindow.once('ready-to-show', () => mainWindow && mainWindow.show());
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
-  mainWindow.loadFile(ENTRY_FILE).catch((error) => {
+  mainWindow.loadFile(ENTRY_FILE).then(async () => {
+    if (smokeTest) await require('../scripts/windows-smoke.cjs').runAppSmoke({ app, mainWindow, userDataPath: app.getPath('userData') });
+  }).catch((error) => {
     console.error('[window:load]', error);
     dialog.showErrorBox('启动失败', '无法加载软件界面，请重新安装后再试。');
     app.quit();
   });
+}
+
+const smokeTest = process.argv.includes('--smoke-test');
+if (smokeTest || process.env.CLINIC_SMOKE_USER_DATA) {
+  const selectedPath = process.env.CLINIC_SMOKE_USER_DATA || '';
+  const resolved = path.resolve(selectedPath);
+  const temporaryRoot = path.resolve(os.tmpdir());
+  let safeDirectory = false;
+  try {
+    const stats = fsSync.lstatSync(resolved);
+    safeDirectory = stats.isDirectory() && !stats.isSymbolicLink();
+  } catch {}
+  if (!smokeTest || !path.isAbsolute(selectedPath) || !isPathInside(temporaryRoot, resolved)
+    || resolved === temporaryRoot || !path.basename(resolved).startsWith('clinic-smoke-')
+    || path.dirname(resolved) !== temporaryRoot || !safeDirectory) {
+    console.error('Smoke test requires an isolated clinic-smoke- directory directly inside the system temporary directory.');
+    app.exit(1);
+  } else {
+    app.setPath('userData', resolved);
+  }
 }
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -450,6 +350,7 @@ if (!hasSingleInstanceLock) {
   });
 
   app.whenReady().then(() => {
+    storage = createStorage({ dataPath: getDataPath(), safeStorage });
     hardenSession();
     registerIpcHandlers();
     createWindow();

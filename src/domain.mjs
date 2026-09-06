@@ -1,4 +1,6 @@
 export const STORE_VERSION = 1;
+export const MAX_DOCUMENTS = 20000;
+export const MAX_CATALOG_ITEMS = 10000;
 
 export const DOCUMENT_STATUS = Object.freeze({
   DRAFT: "draft",
@@ -110,6 +112,140 @@ export function normalizeStore(value) {
   };
 }
 
+export function validateStoredStore(value) {
+  assertStored(isRecord(value), "", "数据文件必须是收费软件的数据对象");
+  assertStored(
+    value.version === STORE_VERSION,
+    "version",
+    "数据版本不受支持，请使用版本 1 的收费数据或备份",
+  );
+  for (const field of ["catalogItems", "documents", "printProfiles"]) {
+    assertStored(Array.isArray(value[field]), field, `数据文件缺少 ${field} 列表`);
+  }
+  assertStored(isRecord(value.settings), "settings", "数据文件缺少设置对象");
+  assertJsonValue(value);
+  assertUniqueStoredIds(value.catalogItems, "catalogItems");
+  assertUniqueStoredIds(value.documents, "documents");
+  assertUniqueStoredIds(value.printProfiles, "printProfiles");
+
+  value.catalogItems.forEach((item, index) => {
+    validateStoredCatalogItem(item, `catalogItems.${index}`);
+    assertStored(Boolean(text(item.name)), `catalogItems.${index}.name`, "项目名称不能为空");
+  });
+
+  const serials = new Set();
+  value.documents.forEach((document, index) => {
+    const path = `documents.${index}`;
+    assertStored(Array.isArray(document.lines), `${path}.lines`, "单据缺少明细列表");
+    assertStored(Object.values(DOCUMENT_STATUS).includes(document.status), `${path}.status`, "单据状态无效");
+    assertStoredTextFields(document, path, [
+      "serial", "patientName", "patientType", "doctorName", "operatorName",
+      "organizationName", "note", "printProfileId", "confirmedBy", "voidedBy", "voidReason",
+    ]);
+    assertStoredDate(document.businessDate, `${path}.businessDate`);
+    for (const field of ["statisticsStartDate", "statisticsEndDate"]) {
+      if (document[field] !== undefined && document[field] !== "") {
+        assertStoredDate(document[field], `${path}.${field}`);
+      }
+    }
+    assertStoredTimestamps(document, path, ["createdAt", "updatedAt", "confirmedAt", "voidedAt"]);
+    if (document.locked !== undefined) {
+      assertStored(document.locked === (document.status !== DOCUMENT_STATUS.DRAFT), `${path}.locked`, "单据锁定状态与业务状态不一致");
+    }
+    if (document.copiedFromDocumentId !== undefined && document.copiedFromDocumentId !== null) {
+      assertStoredIdentifier(document.copiedFromDocumentId, `${path}.copiedFromDocumentId`);
+    }
+    const serial = document.serial ?? "";
+    if (serial) {
+      assertStored(/^\d{12}$/.test(serial) && serial.startsWith(document.businessDate.replaceAll("-", "")), `${path}.serial`, "流水号格式或收费日期不一致");
+      assertStored(!serials.has(serial), `${path}.serial`, "单据流水号重复，无法安全读取");
+      serials.add(serial);
+    }
+    assertUniqueStoredIds(document.lines, `${path}.lines`);
+    document.lines.forEach((line, lineIndex) => {
+      const linePath = `${path}.lines.${lineIndex}`;
+      assertStored(isRecord(line.itemSnapshot), `${linePath}.itemSnapshot`, "收费项目缺少项目快照");
+      validateStoredCatalogItem(line.itemSnapshot, `${linePath}.itemSnapshot`);
+      assertStoredCents(line.unitPriceCents, `${linePath}.unitPriceCents`);
+      assertStoredCents(line.amountCents, `${linePath}.amountCents`);
+      let expectedAmount;
+      try {
+        expectedAmount = calculateLineAmount(line.unitPriceCents, parsePositiveQuantity(line.quantity));
+      } catch (error) {
+        throw new DomainError("INVALID_STORE", `${linePath}.quantity：${error.message}`, { path: `${linePath}.quantity` });
+      }
+      assertStored(line.amountCents === expectedAmount, `${linePath}.amountCents`, "项目金额与单价、数量不一致");
+      assertStored(line.itemSnapshot.unitPriceCents === line.unitPriceCents, `${linePath}.itemSnapshot.unitPriceCents`, "项目单价与历史快照不一致");
+      if (line.catalogItemId !== undefined && line.catalogItemId !== null) {
+        assertStoredIdentifier(line.catalogItemId, `${linePath}.catalogItemId`);
+        assertStored(line.catalogItemId === line.itemSnapshot.id, `${linePath}.catalogItemId`, "项目标识与历史快照不一致");
+      }
+    });
+    assertStoredCents(document.totalCents, `${path}.totalCents`);
+    assertStored(document.totalCents === sumLineAmounts(document.lines), `${path}.totalCents`, "单据合计与明细金额不一致");
+
+    if (document.status !== DOCUMENT_STATUS.DRAFT) {
+      const validation = validateDocument(document);
+      if (!validation.valid) {
+        throw new DomainError("INVALID_STORE", `第 ${index + 1} 张单据：${validation.errors[0].message}`, validation.errors);
+      }
+    }
+  });
+
+  value.printProfiles.forEach((profile, index) => {
+    const path = `printProfiles.${index}`;
+    assertStoredTextFields(profile, path, ["name", "printerName"]);
+    assertStored(["blank", "preprinted"].includes(profile.mode), `${path}.mode`, "打印模式无效");
+    for (const field of ["paperWidthMm", "paperHeightMm"]) {
+      assertStoredFiniteNumber(profile[field], `${path}.${field}`, 0, false);
+    }
+    assertStored(isRecord(profile.marginsMm), `${path}.marginsMm`, "打印边距缺失");
+    assertStored(isRecord(profile.offsetMm), `${path}.offsetMm`, "打印偏移缺失");
+    for (const field of ["top", "right", "bottom", "left"]) {
+      assertStoredFiniteNumber(profile.marginsMm[field], `${path}.marginsMm.${field}`, 0);
+    }
+    for (const field of ["x", "y"]) {
+      assertStoredFiniteNumber(profile.offsetMm[field], `${path}.offsetMm.${field}`);
+    }
+    assertStored(profile.marginsMm.left + profile.marginsMm.right < profile.paperWidthMm && profile.marginsMm.top + profile.marginsMm.bottom < profile.paperHeightMm, `${path}.marginsMm`, "打印边距超出纸张范围");
+    if (profile.isDefault !== undefined) {
+      assertStored(typeof profile.isDefault === "boolean", `${path}.isDefault`, "默认打印标记无效");
+    }
+  });
+  assertStoredTextFields(value.settings, "settings", ["organizationName", "documentTitle", "defaultPrintProfileId", "defaultOperator"]);
+  const requestedProfile = value.settings.defaultPrintProfileId;
+  if (requestedProfile) {
+    const knownProfiles = [...DEFAULT_PRINT_PROFILES, ...value.printProfiles];
+    assertStored(knownProfiles.some((profile) => profile.id === requestedProfile), "settings.defaultPrintProfileId", "默认打印档案不存在");
+  }
+
+  const normalized = normalizeStore(value);
+  return {
+    ...cloneJson(value),
+    ...normalized,
+    catalogItems: normalized.catalogItems.map((item, index) => ({ ...item, ...cloneJson(value.catalogItems[index]) })),
+    documents: normalized.documents.map((document, index) => ({
+      ...document,
+      ...cloneJson(value.documents[index]),
+      lines: document.lines.map((line, lineIndex) => {
+        const source = value.documents[index].lines[lineIndex];
+        return { ...line, ...cloneJson(source), itemSnapshot: { ...line.itemSnapshot, ...cloneJson(source.itemSnapshot) } };
+      }),
+    })),
+    printProfiles: normalized.printProfiles.map((profile) => ({
+      ...profile,
+      ...cloneJson(value.printProfiles.find((source) => source.id === profile.id) ?? {}),
+      isDefault: profile.isDefault,
+    })),
+    settings: { ...normalized.settings, ...cloneJson(value.settings) },
+  };
+}
+
+export function getStoreCapacity(store) {
+  const documents = arrayOrEmpty(store?.documents).length;
+  return { documents, maxDocuments: MAX_DOCUMENTS, warning: documents >= MAX_DOCUMENTS * 0.8 };
+}
+
 export function createId(prefix = "id", options = {}) {
   const safePrefix =
     text(prefix, "id")
@@ -194,6 +330,13 @@ export function calculateLineAmount(unitPriceCents, quantity) {
     throw new DomainError("AMOUNT_OUT_OF_RANGE", "行金额超出安全范围");
   }
   return result;
+}
+
+export function parsePositiveQuantity(value) {
+  if ((typeof value !== "string" && typeof value !== "number") || (typeof value === "number" && !Number.isFinite(value))) {
+    throw new DomainError("INVALID_QUANTITY", "数量必须是有限数字，最多保留三位小数");
+  }
+  return quantityToNumber(value);
 }
 
 export function toChineseUppercase(cents) {
@@ -904,6 +1047,88 @@ function callIdFactory(factory, prefix) {
 
 function validationError(path, code, message) {
   return { path, code, message };
+}
+
+function assertStored(condition, path, message) {
+  if (!condition) {
+    throw new DomainError("INVALID_STORE", `${path ? `${path}：` : ""}${message}`, { path });
+  }
+}
+
+function assertJsonValue(value, path = "", ancestors = new WeakSet(), depth = 0) {
+  assertStored(depth <= 32, path, "数据嵌套层数过多");
+  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+  if (typeof value === "number") {
+    assertStored(Number.isFinite(value), path, "数据包含无效数字");
+    return;
+  }
+  assertStored(Array.isArray(value) || isRecord(value), path, "数据包含无法保存的值");
+  if (Array.isArray(value)) {
+    assertStored(Object.keys(value).length === value.length && Array.from({ length: value.length }, (_, index) => Object.hasOwn(value, index)).every(Boolean), path, "列表包含空缺或无法保存的字段");
+  } else {
+    const prototype = Object.getPrototypeOf(value);
+    assertStored(prototype === Object.prototype || prototype === null, path, "数据必须使用普通 JSON 对象");
+  }
+  assertStored(!ancestors.has(value), path, "数据不能循环引用");
+  ancestors.add(value);
+  for (const [key, child] of Object.entries(value)) {
+    assertStored(!["__proto__", "constructor", "prototype"].includes(key), path, "数据包含不支持的字段名");
+    assertJsonValue(child, path ? `${path}.${key}` : key, ancestors, depth + 1);
+  }
+  ancestors.delete(value);
+}
+
+function assertStoredIdentifier(value, path) {
+  assertStored(typeof value === "string" && value.length > 0 && value === value.trim(), path, "数据标识缺失或无效");
+}
+
+function assertUniqueStoredIds(items, path) {
+  const seen = new Set();
+  items.forEach((item, index) => {
+    assertStored(isRecord(item), `${path}.${index}`, "列表中包含无效记录");
+    assertStoredIdentifier(item.id, `${path}.${index}.id`);
+    assertStored(!seen.has(item.id), `${path}.${index}.id`, "记录标识重复，无法安全读取");
+    seen.add(item.id);
+  });
+}
+
+function assertStoredTextFields(value, path, fields) {
+  for (const field of fields) {
+    if (value[field] !== undefined) {
+      assertStored(typeof value[field] === "string", `${path}.${field}`, "该字段必须是文本");
+    }
+  }
+}
+
+function assertStoredCents(value, path) {
+  assertStored(Number.isSafeInteger(value) && value >= 0, path, "金额必须是非负安全整数分");
+}
+
+function assertStoredFiniteNumber(value, path, minimum = -Infinity, inclusive = true) {
+  assertStored(typeof value === "number" && Number.isFinite(value) && (inclusive ? value >= minimum : value > minimum), path, "打印尺寸或偏移不是有效数字");
+}
+
+function assertStoredDate(value, path) {
+  const match = typeof value === "string" && /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  assertStored(match && isValidDateParts(Number(match[1]), Number(match[2]), Number(match[3])), path, "日期无效");
+}
+
+function assertStoredTimestamps(value, path, fields) {
+  for (const field of fields) {
+    if (value[field] === undefined || ((field === "confirmedAt" || field === "voidedAt") && value[field] === null)) continue;
+    assertStored(Boolean(validIso(value[field])), `${path}.${field}`, "记录时间无效");
+  }
+}
+
+function validateStoredCatalogItem(item, path) {
+  assertStored(isRecord(item), path, "收费项目数据无效");
+  assertStoredIdentifier(item.id, `${path}.id`);
+  assertStoredTextFields(item, path, ["code", "name", "specification", "spec", "unit", "category", "summaryCategory"]);
+  assertStoredCents(item.unitPriceCents, `${path}.unitPriceCents`);
+  if (item.enabled !== undefined) {
+    assertStored(typeof item.enabled === "boolean", `${path}.enabled`, "项目启用状态无效");
+  }
+  assertStoredTimestamps(item, path, ["createdAt", "updatedAt"]);
 }
 
 function normalizeSearchText(value) {

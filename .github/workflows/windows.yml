@@ -1,0 +1,40 @@
+name: Windows build and smoke test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run package:win
+      - run: npm run test:windows
+      - name: Upload tested Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClinicCharge-Windows-x64
+          path: release/ClinicCharge-win32-x64/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload Windows verification report
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-smoke-report
+          path: release/windows-smoke-report.json
+          if-no-files-found: error
+          retention-days: 14

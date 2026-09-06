@@ -1,6 +1,6 @@
 {
   "name": "clinic-charge-desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Windows 单机离线门诊收费录入、查询与打印软件",
   "type": "module",
@@ -8,8 +8,9 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check src/domain.mjs && node --check src/app.mjs && node --check electron/main.cjs && node --check electron/preload.cjs && npm test",
-    "package:win": "electron-packager . ClinicCharge --platform=win32 --arch=x64 --out=release --overwrite --asar --prune=true --ignore='^/release$' --ignore='^/tests$' --win32metadata.ProductName='门诊收费录入打印软件' --win32metadata.FileDescription='门诊收费录入打印软件'"
+    "check": "node --check src/domain.mjs && node --check src/app.mjs && node --check electron/main.cjs && node --check electron/preload.cjs && node --check electron/storage.cjs && node --check scripts/windows-smoke.cjs && npm test",
+    "package:win": "node scripts/package-windows.mjs",
+    "test:windows": "node scripts/windows-smoke.cjs"
   },
   "devDependencies": {
     "@electron/packager": "20.3.0",

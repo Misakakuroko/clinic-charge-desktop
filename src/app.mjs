@@ -1,7 +1,11 @@
 import {
   DEFAULT_PRINT_PROFILES,
   createEmptyStore,
-  normalizeStore,
+  validateStoredStore,
+  parsePositiveQuantity,
+  getStoreCapacity,
+  MAX_DOCUMENTS,
+  MAX_CATALOG_ITEMS,
   createId,
   parseMoneyToCents,
   formatMoney,
@@ -47,9 +51,93 @@ let activeHistoryId = null;
 let previewDocument = null;
 let toastTimer = null;
 let storageProtection = "browser";
+let operationPromise = null;
+let historyPage = 1;
+let previewProfile = null;
+const HISTORY_PAGE_SIZE = 50;
+const dirtyAreas = new Set();
+const lineEdits = new Map();
+let eventsBound = false;
+let clockTimer = null;
 
-function isFiniteNumber(value) {
-  return typeof value === "number" && Number.isFinite(value);
+function markDirty(area, dirty = true) {
+  if (dirty) dirtyAreas.add(area);
+  else dirtyAreas.delete(area);
+  if (!operationPromise && $("#save-state")) $("#save-state").textContent = dirtyAreas.size ? "有未保存更改" : "已保存";
+  window.clinicDesktop?.setDirty?.(dirtyAreas.size > 0).catch(() => {});
+}
+
+function runExclusive(action) {
+  if (operationPromise) return Promise.resolve(false);
+  const roots = [$(".app-shell"), ...$$("dialog[open]")].filter(Boolean);
+  roots.forEach((root) => { root.inert = true; });
+  document.body.setAttribute("aria-busy", "true");
+  operationPromise = Promise.resolve().then(action).catch((error) => {
+    showToast(error?.message || "操作未完成，请重试", true);
+    return false;
+  }).finally(() => {
+    roots.forEach((root) => { root.inert = false; });
+    document.body.removeAttribute("aria-busy");
+    operationPromise = null;
+    if ($("#save-state")) $("#save-state").textContent = dirtyAreas.size ? "有未保存更改" : "已保存";
+  });
+  return operationPromise;
+}
+
+function chooseUnsaved() {
+  const dialog = $("#unsaved-dialog");
+  return new Promise((resolve) => {
+    const finish = (choice) => {
+      dialog.removeEventListener("click", click);
+      dialog.removeEventListener("cancel", cancel);
+      dialog.close();
+      resolve(choice);
+    };
+    const click = (event) => {
+      const choice = event.target.closest("[data-unsaved-choice]")?.dataset.unsavedChoice;
+      if (choice) finish(choice);
+    };
+    const cancel = (event) => { event.preventDefault(); finish("cancel"); };
+    dialog.addEventListener("click", click);
+    dialog.addEventListener("cancel", cancel);
+    dialog.showModal();
+  });
+}
+
+async function resolveUnsaved(areas = [...dirtyAreas]) {
+  const pending = areas.filter((area) => dirtyAreas.has(area));
+  if (!pending.length) return true;
+  const choice = await chooseUnsaved();
+  if (choice === "cancel") return false;
+  if (choice === "save") {
+    if (pending.includes("billing") && !(await saveDraft())) return false;
+    if (pending.includes("settings") && !(await savePrintSettings())) return false;
+    if (pending.includes("catalog") && !(await submitCatalog())) return false;
+  } else {
+    if (pending.includes("billing")) {
+      const saved = store.documents.find((doc) => doc.id === currentDocument.id);
+      selectDocument(saved ? clone(saved) : createFreshDocument());
+    }
+    if (pending.includes("settings")) { renderLocalSettings(); renderPrintProfiles(); }
+    if (pending.includes("catalog")) $("#catalog-dialog").close();
+    for (const area of pending) markDirty(area, false);
+  }
+  return true;
+}
+
+function selectDocument(doc) {
+  currentDocument = doc;
+  lineEdits.clear();
+  markDirty("billing", false);
+  $("#billing-error").hidden = true;
+  renderBilling();
+}
+
+function updateCapacity() {
+  const capacity = getStoreCapacity(store);
+  const warning = $("#capacity-warning");
+  warning.hidden = !capacity.warning;
+  warning.textContent = `本机已有 ${capacity.documents} 张单据，接近本版 ${capacity.maxDocuments} 张的支持上限。请导出备份并联系维护者扩容；已有记录仍可查询和导出。`;
 }
 
 function moneyText(cents) {
@@ -66,21 +154,13 @@ function moneyInputText(cents) {
 }
 
 function parseCents(value) {
-  try {
-    const cents = parseMoneyToCents(String(value ?? ""));
-    return isFiniteNumber(cents) ? cents : 0;
-  } catch {
-    const number = Number(String(value ?? "").replaceAll(",", ""));
-    return Number.isFinite(number) ? Math.round(number * 100) : 0;
-  }
+  const cents = parseMoneyToCents(String(value ?? ""));
+  if (cents < 0) throw new Error("单价不能为负数");
+  return cents;
 }
 
 function lineAmount(line) {
-  try {
-    return calculateLineAmount(line.unitPriceCents, line.quantity);
-  } catch {
-    return Math.round((Number(line.unitPriceCents) || 0) * (Number(line.quantity) || 0));
-  }
+  return calculateLineAmount(line.unitPriceCents, line.quantity);
 }
 
 function uppercaseText(cents) {
@@ -101,12 +181,7 @@ function displayItemName(item = {}) {
 }
 
 function makeSerial(date = todayIso()) {
-  try { return nextSerial(store.documents, date); }
-  catch {
-    const day = date.replaceAll("-", "");
-    const count = store.documents.filter((item) => String(item.serial || "").startsWith(day)).length + 1;
-    return `${day}${String(count).padStart(4, "0")}`;
-  }
+  return nextSerial(store.documents, date);
 }
 
 function defaultProfileId() {
@@ -170,7 +245,7 @@ function normalizeLoaded(raw) {
     storageProtection = value.storageProtection || "plain";
     value = value.data;
   }
-  const normalized = normalizeStore(value || createEmptyStore());
+  const normalized = value == null ? createEmptyStore() : validateStoredStore(value);
   if (!normalized.printProfiles?.length) normalized.printProfiles = defaultProfiles();
   return normalized;
 }
@@ -190,7 +265,7 @@ async function loadStore() {
   try {
     store = normalizeLoaded(JSON.parse(localStorage.getItem(STORAGE_KEY) || "null"));
   } catch {
-    store = normalizeLoaded(null);
+    throw new Error("浏览器草稿无法读取，请恢复备份；原数据已保留。");
   }
   storageProtection = "browser";
   setStorageLabel("browser");
@@ -199,18 +274,20 @@ async function loadStore() {
 async function persistStore(message = "已保存到本机") {
   $("#save-state").textContent = "保存中…";
   try {
+    const snapshot = validateStoredStore(store);
     if (window.clinicDesktop?.saveData) {
-      await window.clinicDesktop.saveData(store);
+      await window.clinicDesktop.saveData(snapshot);
     } else {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
     }
     $("#save-state").textContent = "已同步";
     if (message) showToast(message);
+    updateCapacity();
     return true;
   } catch (error) {
     console.error(error);
     $("#save-state").textContent = "保存失败";
-    showToast("保存失败，请稍后重试", true);
+    showToast(error?.message || "保存失败，请稍后重试", true);
     return false;
   }
 }
@@ -262,6 +339,8 @@ function renderLocalSettings() {
 
 function upsertDocument(documentValue) {
   const index = store.documents.findIndex((item) => item.id === documentValue.id);
+  if (index < 0 && store.documents.length >= MAX_DOCUMENTS) throw new Error("单据已达到本版支持上限，请先导出备份并联系维护者扩容。");
+  if (store.documents.some((item) => item.id !== documentValue.id && item.serial === documentValue.serial)) throw new Error("流水号重复，请重新新建清单。");
   if (index >= 0) store.documents[index] = clone(documentValue);
   else store.documents.unshift(clone(documentValue));
 }
@@ -329,11 +408,12 @@ function renderLines() {
   currentDocument.totalCents = currentDocument.lines.reduce((sum, line) => sum + line.amountCents, 0);
   tbody.innerHTML = currentDocument.lines.map((line, index) => {
     const item = line.itemSnapshot || {};
+    const edits = lineEdits.get(line.id);
     return `<tr data-line-id="${escapeHtml(line.id)}">
       <td class="row-num">${String(index + 1).padStart(2, "0")}</td>
       <td><input class="name-input" data-field="name" value="${escapeHtml(displayItemName(item))}" aria-label="第${index + 1}项名称及规格" ${locked ? "disabled" : ""}></td>
-      <td><input class="money-input" data-field="unitPrice" inputmode="decimal" value="${moneyInputText(line.unitPriceCents)}" aria-label="第${index + 1}项单价" ${locked ? "disabled" : ""}></td>
-      <td><input class="qty-input" data-field="quantity" inputmode="decimal" value="${escapeHtml(line.quantity ?? 1)}" aria-label="第${index + 1}项数量" ${locked ? "disabled" : ""}></td>
+      <td><input class="money-input" data-field="unitPrice" inputmode="decimal" value="${escapeHtml(edits?.price ?? moneyInputText(line.unitPriceCents))}" aria-label="第${index + 1}项单价" ${locked ? "disabled" : ""}></td>
+      <td><input class="qty-input" data-field="quantity" inputmode="decimal" value="${escapeHtml(edits?.quantity ?? line.quantity ?? 1)}" aria-label="第${index + 1}项数量" ${locked ? "disabled" : ""}></td>
       <td><input class="unit-input" data-field="unit" value="${escapeHtml(item.unit || "次")}" maxlength="8" aria-label="第${index + 1}项单位" ${locked ? "disabled" : ""}></td>
       <td class="line-amount">${moneyText(line.amountCents)}</td>
       <td><button class="remove-line" type="button" title="删除此项" aria-label="删除第${index + 1}项" ${locked ? "disabled" : ""}>×</button></td>
@@ -343,25 +423,83 @@ function renderLines() {
   $("#line-count").textContent = `${currentDocument.lines.length} 项`;
   $("#total-amount").textContent = moneyText(currentDocument.totalCents);
   $("#total-uppercase").textContent = uppercaseText(currentDocument.totalCents);
+  if (!locked) $$("#line-items tr").forEach((row) => mutateLineFromRow(row, false));
 }
 
-function mutateLineFromRow(row) {
+function validateNumberControl(control, parser) {
+  try {
+    const value = parser(control.value);
+    control.setCustomValidity("");
+    control.removeAttribute("aria-invalid");
+    control.removeAttribute("title");
+    return { valid: true, value };
+  } catch (error) {
+    control.setCustomValidity(error.message);
+    control.setAttribute("aria-invalid", "true");
+    control.title = error.message;
+    return { valid: false };
+  }
+}
+
+function validateBillingInputs() {
+  $$("#line-items tr").forEach((row) => mutateLineFromRow(row, false));
+  const invalid = $("#line-items [aria-invalid='true']");
+  const error = $("#billing-error");
+  error.hidden = !invalid;
+  if (invalid) {
+    error.textContent = `${invalid.getAttribute("aria-label")}：${invalid.validationMessage}`;
+    setTimeout(() => { invalid.focus(); invalid.reportValidity(); }, 0);
+    showToast("请先修正单价或数量，再保存或打印", true);
+    return false;
+  }
+  return true;
+}
+
+function mutateLineFromRow(row, changed = true) {
+  if (currentDocument.locked) return;
   const line = currentDocument.lines.find((item) => item.id === row.dataset.lineId);
   if (!line) return;
+  if (changed) markDirty("billing");
   const nameAndSpec = $("[data-field='name']", row).value.trim();
-  const price = parseCents($("[data-field='unitPrice']", row).value);
-  const rawQuantity = Number($("[data-field='quantity']", row).value);
-  const quantity = Number.isFinite(rawQuantity) && rawQuantity > 0 ? rawQuantity : 1;
+  const priceControl = $("[data-field='unitPrice']", row);
+  const quantityControl = $("[data-field='quantity']", row);
+  lineEdits.set(line.id, { price: priceControl.value, quantity: quantityControl.value });
+  const price = validateNumberControl(priceControl, parseCents);
+  const quantity = validateNumberControl(quantityControl, parsePositiveQuantity);
   const unit = $("[data-field='unit']", row).value.trim() || "次";
-  line.itemSnapshot = { ...(line.itemSnapshot || {}), name: nameAndSpec, specification: "", unit, unitPriceCents: price };
-  line.unitPriceCents = price;
-  line.quantity = quantity;
-  line.amountCents = lineAmount(line);
-  currentDocument.totalCents = currentDocument.lines.reduce((sum, item) => sum + lineAmount(item), 0);
+  if (changed) {
+    if (nameAndSpec !== displayItemName(line.itemSnapshot)) {
+      line.itemSnapshot = { ...line.itemSnapshot, name: nameAndSpec, specification: "" };
+    }
+    line.itemSnapshot.unit = unit;
+  }
+  if (!price.valid || !quantity.valid) {
+    $(".line-amount", row).textContent = "请检查输入";
+    $("#total-amount").textContent = "—";
+    $("#total-uppercase").textContent = "请修正单价或数量";
+    return;
+  }
+  let amount;
+  try { amount = calculateLineAmount(price.value, quantity.value); }
+  catch (error) {
+    quantityControl.setCustomValidity(error.message);
+    quantityControl.setAttribute("aria-invalid", "true");
+    $(".line-amount", row).textContent = "金额超出范围";
+    $("#total-amount").textContent = "—";
+    $("#total-uppercase").textContent = "请修正单价或数量";
+    return;
+  }
+  line.itemSnapshot.unitPriceCents = price.value;
+  line.unitPriceCents = price.value;
+  line.quantity = quantity.value;
+  line.amountCents = amount;
+  currentDocument.totalCents = currentDocument.lines.reduce((sum, item) => sum + item.amountCents, 0);
   $(".line-amount", row).textContent = moneyText(line.amountCents);
-  $("#total-amount").textContent = moneyText(currentDocument.totalCents);
-  $("#total-uppercase").textContent = uppercaseText(currentDocument.totalCents);
-  currentDocument.updatedAt = nowIso();
+  const hasInvalid = Boolean($("#line-items [aria-invalid='true']"));
+  $("#total-amount").textContent = hasInvalid ? "—" : moneyText(currentDocument.totalCents);
+  $("#total-uppercase").textContent = hasInvalid ? "请修正单价或数量" : uppercaseText(currentDocument.totalCents);
+  if (!hasInvalid) $("#billing-error").hidden = true;
+  if (changed) currentDocument.updatedAt = nowIso();
 }
 
 function itemToLine(item) {
@@ -377,13 +515,16 @@ function addCatalogItem(item) {
   if (currentDocument.locked) return;
   currentDocument.lines.push(itemToLine(item));
   currentDocument.updatedAt = nowIso();
+  markDirty("billing");
   renderLines();
   showToast(`已添加：${item.name}`);
 }
 
 function addTemporaryItem() {
+  if (currentDocument.locked) return;
   const item = { id: createId("temp-item"), code: "TEMP", name: "临时项目", specification: "", unit: "次", unitPriceCents: 0, enabled: true };
   currentDocument.lines.push(itemToLine(item));
+  markDirty("billing");
   renderLines();
   const lastRow = $("#line-items tr:last-child");
   $("[data-field='name']", lastRow)?.select();
@@ -413,16 +554,21 @@ function renderPicker() {
 }
 
 async function saveDraft() {
+  if (!currentDocument || currentDocument.locked) return !dirtyAreas.has("billing");
+  if (!validateBillingInputs()) return false;
   updateCurrentFromInputs();
-  if (currentDocument.locked) return;
   const previousDocuments = clone(store.documents);
   upsertDocument(currentDocument);
   if (!(await persistStore("草稿已保存到本机"))) {
     store.documents = previousDocuments;
+    return false;
   }
+  markDirty("billing", false);
+  return true;
 }
 
 async function confirmCurrent() {
+  if (currentDocument.locked || !validateBillingInputs()) return false;
   updateCurrentFromInputs();
   if (!currentDocument.serial) currentDocument.serial = makeSerial(currentDocument.businessDate);
   const result = validateDocument(currentDocument);
@@ -446,8 +592,13 @@ async function confirmCurrent() {
       renderBilling();
       return;
     }
+    markDirty("billing", false);
     renderBilling();
+    return true;
   } catch (error) {
+    currentDocument = previousDocument;
+    store.documents = previousDocuments;
+    renderBilling();
     showToast(error?.message || "确认失败，请检查清单内容", true);
   }
 }
@@ -477,7 +628,12 @@ function renderHistory() {
     .filter((doc) => documentMatches(doc, filters))
     .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
   $("#history-count").textContent = `${documents.length} 条记录`;
-  $("#history-rows").innerHTML = documents.map((doc) => `<tr>
+  const pageCount = Math.max(1, Math.ceil(documents.length / HISTORY_PAGE_SIZE));
+  historyPage = Math.max(1, Math.min(historyPage, pageCount));
+  $("#history-page").textContent = `第 ${historyPage} / ${pageCount} 页，每页 ${HISTORY_PAGE_SIZE} 条`;
+  $("#history-prev").disabled = historyPage === 1;
+  $("#history-next").disabled = historyPage === pageCount;
+  $("#history-rows").innerHTML = documents.slice((historyPage - 1) * HISTORY_PAGE_SIZE, historyPage * HISTORY_PAGE_SIZE).map((doc) => `<tr>
     <td class="serial">${escapeHtml(doc.serial || "—")}</td>
     <td class="date-cell">${escapeHtml(doc.businessDate || "—")}</td>
     <td>${escapeHtml(doc.patientName || "未填写")}</td>
@@ -510,8 +666,35 @@ function renderHistoryDetail(doc) {
   $("#history-actions").innerHTML = `<span></span><div>${actions}</div>`;
 }
 
+function askVoidReason() {
+  const dialog = $("#void-dialog");
+  const form = $("#void-form");
+  $("#void-reason").value = "录入有误";
+  return new Promise((resolve) => {
+    const finish = (value) => {
+      form.removeEventListener("submit", submit);
+      dialog.removeEventListener("cancel", cancel);
+      $("#cancel-void").removeEventListener("click", cancel);
+      dialog.close();
+      resolve(value);
+    };
+    const submit = (event) => {
+      event.preventDefault();
+      const value = $("#void-reason").value.trim();
+      if (value) finish(value);
+    };
+    const cancel = (event) => { event.preventDefault(); finish(null); };
+    form.addEventListener("submit", submit);
+    dialog.addEventListener("cancel", cancel);
+    $("#cancel-void").addEventListener("click", cancel);
+    dialog.showModal();
+  });
+}
+
 async function voidRecord(doc, reopenAfter = false) {
-  const reason = window.prompt("请输入作废原因（会保留在历史记录中）：", "录入有误");
+  if (reopenAfter && store.documents.length >= MAX_DOCUMENTS) throw new Error("单据已达到容量上限，请先导出备份并联系维护者；原单未作废。");
+  if (reopenAfter && !(await resolveUnsaved(["billing"]))) return false;
+  const reason = await askVoidReason();
   if (reason === null) return;
   if (!reason.trim()) { showToast("请填写作废原因", true); return; }
   const previousDocuments = clone(store.documents);
@@ -535,13 +718,26 @@ async function voidRecord(doc, reopenAfter = false) {
       currentDocument = previousCurrentDocument;
       return;
     }
+    if (!reopenAfter && currentDocument.id === voided.id) currentDocument = clone(voided);
+    if (reopenAfter || currentDocument.id === voided.id) {
+      lineEdits.clear();
+      markDirty("billing", false);
+      renderBilling();
+    }
     $("#history-dialog").close();
     if (reopenAfter) { renderBilling(); switchView("billing"); }
     else renderHistory();
-  } catch (error) { showToast(error?.message || "作废失败", true); }
+  } catch (error) {
+    store.documents = previousDocuments;
+    currentDocument = previousCurrentDocument;
+    renderBilling();
+    showToast(error?.message || "作废失败", true);
+  }
 }
 
 async function reopenVoided(doc) {
+  if (store.documents.length >= MAX_DOCUMENTS) throw new Error("单据已达到容量上限，请先导出备份并联系维护者。");
+  if (!(await resolveUnsaved(["billing"]))) return false;
   const previousDocuments = clone(store.documents);
   const previousCurrentDocument = clone(currentDocument);
   try {
@@ -559,9 +755,16 @@ async function reopenVoided(doc) {
       return;
     }
     $("#history-dialog").close();
+    markDirty("billing", false);
+    lineEdits.clear();
     renderBilling();
     switchView("billing");
-  } catch (error) { showToast(error?.message || "重开失败", true); }
+  } catch (error) {
+    store.documents = previousDocuments;
+    currentDocument = previousCurrentDocument;
+    renderBilling();
+    showToast(error?.message || "重开失败", true);
+  }
 }
 
 function filteredCatalog() {
@@ -589,6 +792,9 @@ function renderCatalog() {
 }
 
 function openCatalogForm(item = null) {
+  markDirty("catalog", false);
+  $("#catalog-price").setCustomValidity("");
+  $("#catalog-price").removeAttribute("aria-invalid");
   $("#catalog-dialog-title").textContent = item ? "编辑收费项目" : "新建收费项目";
   $("#catalog-id").value = item?.id || "";
   $("#catalog-code").value = item?.code || "";
@@ -604,17 +810,21 @@ function openCatalogForm(item = null) {
 }
 
 async function submitCatalog(event) {
-  event.preventDefault();
+  event?.preventDefault();
+  if (!$("#catalog-form").reportValidity()) return false;
   const id = $("#catalog-id").value;
   const code = $("#catalog-code").value.trim();
   const name = $("#catalog-name").value.trim();
   const specification = $("#catalog-specification").value.trim();
   const unit = $("#catalog-unit").value.trim();
-  const unitPriceCents = parseCents($("#catalog-price").value);
+  const price = validateNumberControl($("#catalog-price"), parseCents);
+  if (!price.valid) { setTimeout(() => $("#catalog-price").reportValidity(), 0); return false; }
+  const unitPriceCents = price.value;
   if (!code || !name || !unit || unitPriceCents < 0) { showToast("请完整填写项目编码、名称、单位与价格", true); return; }
   const duplicate = store.catalogItems.find((item) => item.code.toLocaleLowerCase() === code.toLocaleLowerCase() && item.id !== id);
   if (duplicate) { showToast("项目编码已存在", true); $("#catalog-code").focus(); return; }
   const previous = store.catalogItems.find((item) => item.id === id);
+  if (!previous && store.catalogItems.length >= MAX_CATALOG_ITEMS) throw new Error("项目目录已达到支持上限。");
   const previousCatalogItems = clone(store.catalogItems);
   const item = {
     id: id || createId("catalog"), code, name, specification, unit,
@@ -626,10 +836,12 @@ async function submitCatalog(event) {
   else store.catalogItems.push(item);
   if (!(await persistStore(previous ? "项目已更新" : "项目已新增"))) {
     store.catalogItems = previousCatalogItems;
-    return;
+    return false;
   }
+  markDirty("catalog", false);
   $("#catalog-dialog").close();
   renderCatalog(); renderPalette();
+  return true;
 }
 
 async function catalogAction(action, id) {
@@ -698,35 +910,41 @@ function renderPrintProfiles() {
 async function savePrintSettings() {
   const previousSettings = clone(store.settings);
   const previousProfiles = clone(store.printProfiles);
-  store.settings.organizationName = $("#settings-organization").value.trim();
-  store.settings.defaultOperator = $("#settings-operator").value.trim() || "收费员";
-  const cards = $$(".profile-card", $("#print-profiles"));
-  for (const card of cards) {
-    const profile = store.printProfiles.find((item) => item.id === card.dataset.profileId);
+  const profiles = clone(store.printProfiles);
+  const settings = { ...store.settings, organizationName: $("#settings-organization").value.trim(), defaultOperator: $("#settings-operator").value.trim() || "收费员" };
+  const readNumber = (card, field, min, max) => {
+    const control = $("[data-profile-field='" + field + "']", card);
+    const result = validateNumberControl(control, (raw) => {
+      const number = Number(raw);
+      if (!String(raw).trim() || !Number.isFinite(number) || number < min || number > max) throw new Error("请输入 " + min + " 至 " + max + " 之间的数值");
+      return number;
+    });
+    if (!result.valid) { setTimeout(() => { control.focus(); control.reportValidity(); }, 0); throw new Error("打印尺寸或偏移量有误，请检查标红字段"); }
+    return result.value;
+  };
+  for (const card of $$(".profile-card", $("#print-profiles"))) {
+    const profile = profiles.find((item) => item.id === card.dataset.profileId);
     if (!profile) continue;
-    const width = Math.max(20, Number($("[data-profile-field='paperWidthMm']", card).value) || profile.paperWidthMm);
-    const height = Math.max(20, Number($("[data-profile-field='paperHeightMm']", card).value) || profile.paperHeightMm);
-    const contentWidth = Math.min(width, Math.max(10, Number($("[data-profile-field='contentWidthMm']", card).value) || width));
-    const contentHeight = Math.min(height, Math.max(10, Number($("[data-profile-field='contentHeightMm']", card).value) || height));
-    const left = Math.max(0, (width - contentWidth) / 2);
-    const top = Math.max(0, (height - contentHeight) / 2);
+    const width = readNumber(card, "paperWidthMm", 25, 500);
+    const height = readNumber(card, "paperHeightMm", 25, 500);
+    const contentWidth = readNumber(card, "contentWidthMm", 10, width);
+    const contentHeight = readNumber(card, "contentHeightMm", 10, height);
+    const left = (width - contentWidth) / 2, top = (height - contentHeight) / 2;
     profile.paperWidthMm = width; profile.paperHeightMm = height;
-    profile.marginsMm = { top, right: Math.max(0, width - contentWidth - left), bottom: Math.max(0, height - contentHeight - top), left };
-    profile.offsetMm = { x: Number($("[data-profile-field='offsetX']", card).value) || 0, y: Number($("[data-profile-field='offsetY']", card).value) || 0 };
+    profile.marginsMm = { top, right: left, bottom: top, left };
+    profile.offsetMm = { x: readNumber(card, "offsetX", -100, 100), y: readNumber(card, "offsetY", -100, 100) };
     profile.printerName = $("[data-profile-field='printerName']", card).value.trim();
     profile.isDefault = $("[data-profile-field='isDefault']", card).checked;
-    if (profile.isDefault) store.settings.defaultPrintProfileId = profile.id;
+    if (profile.isDefault) settings.defaultPrintProfileId = profile.id;
   }
-  if (!store.printProfiles.some((profile) => profile.isDefault)) store.printProfiles[0].isDefault = true;
+  store.settings = settings; store.printProfiles = profiles;
   if (!(await persistStore("打印设置已保存"))) {
-    store.settings = previousSettings;
-    store.printProfiles = previousProfiles;
-    renderLocalSettings();
-    renderPrintProfiles();
-    renderProfileSelect();
-    return;
+    store.settings = previousSettings; store.printProfiles = previousProfiles;
+    return false;
   }
+  markDirty("settings", false);
   renderPrintProfiles(); renderProfileSelect();
+  return true;
 }
 
 async function loadPrinterOptions() {
@@ -757,37 +975,24 @@ async function exportBackup() {
 }
 
 async function importBackup() {
-  if (!window.clinicDesktop?.importBackup) {
-    showToast("备份导入仅在桌面版可用", true);
-    return;
-  }
-  if (!window.confirm("导入会用备份内容替换当前本机数据，确认继续吗？")) return;
-  const previousStore = clone(store);
-  const previousCurrentDocument = clone(currentDocument);
-  try {
-    const result = await window.clinicDesktop.importBackup();
-    if (result?.canceled) return;
-    store = normalizeLoaded(result?.data);
-    currentDocument = createFreshDocument();
-    if (!(await persistStore("备份已导入并保存"))) {
-      store = previousStore;
-      currentDocument = previousCurrentDocument;
-      return;
-    }
-    renderBilling();
-    renderCatalog();
-    renderHistory();
-    renderLocalSettings();
-    renderPrintProfiles();
-  } catch (error) {
-    showToast(error?.message || "备份导入失败", true);
-  }
+  if (!window.clinicDesktop?.importBackup) { showToast("备份导入仅在桌面版可用", true); return false; }
+  if (!(await resolveUnsaved())) return false;
+  const result = await window.clinicDesktop.importBackup();
+  if (result?.canceled) return false;
+  const restored = validateStoredStore(result.data);
+  const date = result.exportedAt ? new Date(result.exportedAt).toLocaleString("zh-CN") : "旧版备份（无导出日期）";
+  if (!window.confirm("将恢复 " + restored.documents.length + " 张单据、" + restored.catalogItems.length + " 个项目。\n备份时间：" + date + "\n现有数据会先留存副本，然后被此备份替换。确定恢复吗？")) return false;
+  await window.clinicDesktop.restoreBackup(restored);
+  await initialize();
+  showToast("备份已恢复，原数据已留存");
+  return true;
 }
 
 function printMarkup(doc, profile) {
   const org = doc.organizationName || store.settings?.organizationName || "门诊部";
   const title = store.settings?.documentTitle || "门诊项目明细清单";
   return `<div class="print-content ${profile.mode === "preprinted" ? "is-preprinted" : ""}">
+    ${doc.status !== "confirmed" ? `<div class="print-status">${doc.status === "voided" ? "已作废 · 仅供核对" : "草稿 · 尚未确认"}</div>` : ""}
     <h2>${escapeHtml(title)}</h2>
     <div class="print-meta"><span>医疗机构：${escapeHtml(org)}</span><span>内部流水号：${escapeHtml(doc.serial || "")}</span><span>姓名：${escapeHtml(doc.patientName || "")}</span><span>收费日期：${escapeHtml(doc.businessDate || "")}</span><span>统计时间：${escapeHtml(doc.statisticsStartDate || "—")} 至 ${escapeHtml(doc.statisticsEndDate || "—")}</span><span>开具医生：${escapeHtml(doc.doctorName || "—")} / 录入：${escapeHtml(doc.operatorName || "收费员")}</span></div>
     <table><thead><tr><th>项目名称及规格 / 类别</th><th>单价</th><th>数量</th><th>单位</th><th>金额</th></tr></thead><tbody>${(doc.lines || []).map((line) => `<tr><td>${escapeHtml(displayItemName(line.itemSnapshot))}<small class="print-category">${escapeHtml(line.itemSnapshot?.category || "未分类")} / ${escapeHtml(line.itemSnapshot?.summaryCategory || "未分类")}</small></td><td class="print-money">${moneyInputText(line.unitPriceCents)}</td><td class="print-money">${escapeHtml(line.quantity)}</td><td>${escapeHtml(line.itemSnapshot?.unit || "次")}</td><td class="print-money">${moneyInputText(lineAmount(line))}</td></tr>`).join("")}</tbody></table>
@@ -797,118 +1002,204 @@ function printMarkup(doc, profile) {
 }
 
 function showPrintPreview(doc = currentDocument) {
-  updateCurrentFromInputs();
-  if (!doc.lines?.length) { showToast("请先添加至少一个收费项目", true); return; }
+  if (doc.id === currentDocument.id && currentDocument.status === "draft") {
+    if (!validateBillingInputs()) return false;
+    updateCurrentFromInputs();
+    doc = currentDocument;
+  } else {
+    doc = store.documents.find((item) => item.id === doc.id) || doc;
+  }
+  if (!doc.lines?.length) { showToast("请先添加至少一个收费项目", true); return false; }
   previewDocument = clone(doc);
-  const profile = store.printProfiles.find((item) => item.id === (doc.printProfileId || $("#billing-profile").value)) || store.printProfiles[0];
-  if (!profile) { showToast("请先配置打印档案", true); return; }
-  const content = profileContentSize(profile);
-  const sheet = $("#print-sheet");
-  sheet.style.width = `${profile.paperWidthMm}mm`;
-  sheet.style.height = `${profile.paperHeightMm}mm`;
+  const selectedProfileId = doc.id === currentDocument.id ? $("#billing-profile").value : doc.printProfileId;
+  const profile = store.printProfiles.find((item) => item.id === selectedProfileId) || store.printProfiles[0];
+  if (!profile) { showToast("请先配置打印档案", true); return false; }
+  previewProfile = clone(profile);
+  const content = profileContentSize(profile), sheet = $("#print-sheet");
+  sheet.style.width = profile.paperWidthMm + "mm";
+  sheet.style.height = profile.paperHeightMm + "mm";
   sheet.innerHTML = printMarkup(doc, profile);
   const printContent = $(".print-content", sheet);
-  printContent.style.width = `${content.width}mm`;
-  printContent.style.height = `${content.height}mm`;
-  printContent.style.left = `${(profile.marginsMm?.left || 0) + (profile.offsetMm?.x || 0)}mm`;
-  printContent.style.top = `${(profile.marginsMm?.top || 0) + (profile.offsetMm?.y || 0)}mm`;
+  printContent.style.width = content.width + "mm";
+  printContent.style.height = content.height + "mm";
+  printContent.style.left = ((profile.marginsMm?.left || 0) + (profile.offsetMm?.x || 0)) + "mm";
+  printContent.style.top = ((profile.marginsMm?.top || 0) + (profile.offsetMm?.y || 0)) + "mm";
   printContent.style.padding = profile.mode === "blank" ? "3mm" : "1mm";
-  $("#preview-profile-name").textContent = `${profile.name} · ${profile.paperWidthMm}×${profile.paperHeightMm} mm`;
-  $("#print-dialog").showModal();
+  $("#preview-profile-name").textContent = profile.name + " · " + profile.paperWidthMm + "×" + profile.paperHeightMm + " mm";
+  if (!$("#print-dialog").open) $("#print-dialog").showModal();
+  requestAnimationFrame(checkPrintBounds);
+  return true;
+}
+
+function checkPrintBounds() {
+  const content = $("#print-sheet .print-content");
+  if (!content || !previewProfile) return false;
+  const sheet = $("#print-sheet").getBoundingClientRect();
+  const box = content.getBoundingClientRect();
+  const overflow = content.scrollHeight > content.clientHeight + 1 || content.scrollWidth > content.clientWidth + 1 || box.left < sheet.left - 1 || box.top < sheet.top - 1 || box.right > sheet.right + 1 || box.bottom > sheet.bottom + 1;
+  const uncalibrated = previewProfile.mode === "preprinted";
+  const warning = $("#print-warning");
+  warning.hidden = !overflow && !uncalibrated;
+  warning.textContent = uncalibrated ? "套打模板待提供空白票据后定稿，暂不能套打。请先选择空白纸完整打印。" : overflow ? "清单超出单张纸范围，请调整纸型或内容区域；本次打印已暂停，避免漏打金额。" : "";
+  $("#print-now").disabled = overflow || uncalibrated;
+  return !overflow && !uncalibrated;
 }
 
 async function printNow() {
-  if (!previewDocument) return;
-  const profile = store.printProfiles.find((item) => item.id === (previewDocument.printProfileId || defaultProfileId())) || store.printProfiles[0];
+  if (!previewDocument || !previewProfile) return false;
+  const latest = store.documents.find((doc) => doc.id === previewDocument.id);
+  if (latest && latest.status !== previewDocument.status) {
+    showPrintPreview(latest);
+    showToast("单据状态已更新，请重新核对预览", true);
+    return false;
+  }
+  await document.fonts.ready;
+  if (!checkPrintBounds()) return false;
   try {
     if (window.clinicDesktop?.print) {
-      const result = await window.clinicDesktop.print({ profile, deviceName: profile.printerName || "" });
+      const result = await window.clinicDesktop.print({ profile: previewProfile, deviceName: previewProfile.printerName || "" });
       if (result?.success === false && !result?.canceled) throw new Error(result.error || "系统打印失败");
       if (!result?.canceled) showToast("打印任务已发送");
-    } else {
-      window.print();
-    }
-  } catch (error) { showToast(error?.message || "打印失败，请检查打印机", true); }
+    } else window.print();
+    return true;
+  } catch (error) { showToast(error?.message || "打印失败，请检查打印机", true); return false; }
+}
+
+async function navigateView(name) {
+  if (currentView === "printing" && name !== "printing" && !(await resolveUnsaved(["settings"]))) return false;
+  if (name === currentView) return true;
+  switchView(name);
+  return true;
+}
+
+async function editHistoryDocument(doc) {
+  if (doc.id !== currentDocument.id && !(await resolveUnsaved(["billing"]))) return false;
+  if (doc.id === currentDocument.id && dirtyAreas.has("billing")) {
+    $("#history-dialog").close(); switchView("billing"); return true;
+  }
+  selectDocument(clone(store.documents.find((item) => item.id === doc.id) || doc));
+  $("#history-dialog").close();
+  switchView("billing");
+  return true;
 }
 
 function bindEvents() {
-  $$(".nav-item").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
-  $$('[data-go-view]').forEach((button) => button.addEventListener("click", () => switchView(button.dataset.goView)));
-  $("#new-document").addEventListener("click", () => {
-    if (currentDocument.status === "draft" && (currentDocument.patientName || currentDocument.lines.length) && !window.confirm("当前草稿尚未保存，确定新建吗？")) return;
-    currentDocument = createFreshDocument(); renderBilling(); $("#patient-name").focus();
+  if (eventsBound) return;
+  eventsBound = true;
+  const on = (selector, event, action) => $(selector).addEventListener(event, (evt) => {
+    if (event === "submit") evt.preventDefault();
+    void runExclusive(() => action(evt));
   });
-  $("#save-draft").addEventListener("click", saveDraft);
-  $("#confirm-document").addEventListener("click", confirmCurrent);
-  $("#preview-document").addEventListener("click", () => showPrintPreview());
-  $("#billing-profile").addEventListener("change", updateCurrentFromInputs);
-  $("#heading-fields").addEventListener("input", updateCurrentFromInputs);
-  $("#document-note").addEventListener("input", updateCurrentFromInputs);
-  $("#add-temp-line").addEventListener("click", addTemporaryItem);
-  $("#add-catalog-line").addEventListener("click", () => { $("#picker-search").value = ""; renderPicker(); $("#picker-dialog").showModal(); });
-  $("#close-picker").addEventListener("click", () => $("#picker-dialog").close());
+  $$(".nav-item").forEach((button) => button.addEventListener("click", () => void runExclusive(() => navigateView(button.dataset.view))));
+  $$("[data-go-view]").forEach((button) => button.addEventListener("click", () => void runExclusive(() => navigateView(button.dataset.goView))));
+  on("#new-document", "click", async () => {
+    if (!(await resolveUnsaved(["billing"]))) return false;
+    selectDocument(createFreshDocument());
+    setTimeout(() => $("#patient-name").focus(), 0);
+  });
+  on("#save-draft", "click", saveDraft);
+  on("#confirm-document", "click", confirmCurrent);
+  on("#preview-document", "click", () => showPrintPreview());
+  $("#billing-profile").addEventListener("change", () => {
+    if (!currentDocument.locked) { updateCurrentFromInputs(); markDirty("billing"); }
+  });
+  $("#heading-fields").addEventListener("input", () => { updateCurrentFromInputs(); markDirty("billing"); });
+  $("#document-note").addEventListener("input", () => { updateCurrentFromInputs(); markDirty("billing"); });
+  on("#add-temp-line", "click", addTemporaryItem);
+  on("#add-catalog-line", "click", () => { $("#picker-search").value = ""; renderPicker(); $("#picker-dialog").showModal(); });
+  on("#close-picker", "click", () => $("#picker-dialog").close());
   $("#picker-search").addEventListener("input", renderPicker);
-  $("#picker-list").addEventListener("click", (event) => {
+  on("#picker-list", "click", (event) => {
     const button = event.target.closest("[data-item-id]"); if (!button) return;
     const item = store.catalogItems.find((entry) => entry.id === button.dataset.itemId); if (!item) return;
     addCatalogItem(item); $("#picker-dialog").close();
   });
   $("#palette-search").addEventListener("input", renderPalette);
-  $("#palette-list").addEventListener("click", (event) => {
+  on("#palette-list", "click", (event) => {
     const button = event.target.closest("[data-item-id]"); if (!button) return;
     const item = store.catalogItems.find((entry) => entry.id === button.dataset.itemId); if (item) addCatalogItem(item);
   });
   $("#line-items").addEventListener("input", (event) => { const row = event.target.closest("tr"); if (row) mutateLineFromRow(row); });
   $("#line-items").addEventListener("focusout", (event) => {
-    if (event.target.dataset.field === "unitPrice") event.target.value = moneyInputText(parseCents(event.target.value));
+    if (event.target.dataset.field === "unitPrice" && event.target.getAttribute("aria-invalid") !== "true") {
+      event.target.value = moneyInputText(parseCents(event.target.value));
+      const edits = lineEdits.get(event.target.closest("tr").dataset.lineId);
+      if (edits) edits.price = event.target.value;
+    }
   });
   $("#line-items").addEventListener("click", (event) => {
-    const button = event.target.closest(".remove-line"); if (!button) return;
-    const row = button.closest("tr"); currentDocument.lines = currentDocument.lines.filter((line) => line.id !== row.dataset.lineId); renderLines();
+    const button = event.target.closest(".remove-line"); if (!button || currentDocument.locked) return;
+    void runExclusive(() => {
+      const id = button.closest("tr").dataset.lineId;
+      currentDocument.lines = currentDocument.lines.filter((line) => line.id !== id);
+      lineEdits.delete(id); markDirty("billing"); renderLines();
+    });
   });
-  $("#history-filter").addEventListener("submit", (event) => { event.preventDefault(); renderHistory(); });
-  $("#reset-filter").addEventListener("click", () => { $("#history-filter").reset(); renderHistory(); });
-  $("#history-rows").addEventListener("click", (event) => {
+  on("#history-filter", "submit", () => { historyPage = 1; renderHistory(); });
+  on("#reset-filter", "click", () => { $("#history-filter").reset(); historyPage = 1; renderHistory(); });
+  on("#history-prev", "click", () => { historyPage -= 1; renderHistory(); });
+  on("#history-next", "click", () => { historyPage += 1; renderHistory(); });
+  on("#history-rows", "click", async (event) => {
     const button = event.target.closest("[data-history-action]"); if (!button) return;
     const doc = store.documents.find((item) => item.id === button.dataset.id); if (!doc) return;
-    if (button.dataset.historyAction === "edit") { currentDocument = clone(doc); renderBilling(); switchView("billing"); return; }
-    if (button.dataset.historyAction === "print") { showPrintPreview(doc); return; }
+    if (button.dataset.historyAction === "edit") return editHistoryDocument(doc);
+    if (button.dataset.historyAction === "print") return showPrintPreview(doc);
     renderHistoryDetail(doc); $("#history-dialog").showModal();
   });
-  $("#close-history-dialog").addEventListener("click", () => $("#history-dialog").close());
-  $("#history-actions").addEventListener("click", (event) => {
+  on("#close-history-dialog", "click", () => $("#history-dialog").close());
+  on("#history-actions", "click", async (event) => {
     const button = event.target.closest("[data-modal-action]"); if (!button) return;
     const doc = store.documents.find((item) => item.id === activeHistoryId); if (!doc) return;
     const action = button.dataset.modalAction;
-    if (action === "print") { $("#history-dialog").close(); showPrintPreview(doc); }
-    if (action === "void") voidRecord(doc, false);
-    if (action === "void-reopen") voidRecord(doc, true);
-    if (action === "reopen") reopenVoided(doc);
-    if (action === "edit") { currentDocument = clone(doc); $("#history-dialog").close(); renderBilling(); switchView("billing"); }
+    if (action === "print") { $("#history-dialog").close(); return showPrintPreview(doc); }
+    if (action === "void") return voidRecord(doc, false);
+    if (action === "void-reopen") return voidRecord(doc, true);
+    if (action === "reopen") return reopenVoided(doc);
+    if (action === "edit") return editHistoryDocument(doc);
   });
-  $("#create-catalog-item").addEventListener("click", () => openCatalogForm());
-  $("#close-catalog-dialog").addEventListener("click", () => $("#catalog-dialog").close());
-  $("#cancel-catalog").addEventListener("click", () => $("#catalog-dialog").close());
-  $("#catalog-form").addEventListener("submit", submitCatalog);
+  on("#create-catalog-item", "click", () => openCatalogForm());
+  const closeCatalog = async () => { if (await resolveUnsaved(["catalog"])) $("#catalog-dialog").close(); };
+  on("#close-catalog-dialog", "click", closeCatalog);
+  on("#cancel-catalog", "click", closeCatalog);
+  $("#catalog-dialog").addEventListener("cancel", (event) => { event.preventDefault(); void runExclusive(closeCatalog); });
+  on("#catalog-form", "submit", submitCatalog);
+  $("#catalog-form").addEventListener("input", (event) => {
+    markDirty("catalog");
+    if (event.target.id === "catalog-price") validateNumberControl(event.target, parseCents);
+  });
   $("#catalog-search").addEventListener("input", renderCatalog);
-  $("#catalog-rows").addEventListener("click", (event) => { const button = event.target.closest("[data-catalog-action]"); if (button) catalogAction(button.dataset.catalogAction, button.dataset.id); });
-  $("#save-print-settings").addEventListener("click", savePrintSettings);
-  $("#export-backup").addEventListener("click", exportBackup);
-  $("#import-backup").addEventListener("click", importBackup);
+  on("#catalog-rows", "click", (event) => {
+    const button = event.target.closest("[data-catalog-action]");
+    if (button) return catalogAction(button.dataset.catalogAction, button.dataset.id);
+  });
+  on("#save-print-settings", "click", savePrintSettings);
+  on("#export-backup", "click", async () => {
+    if (await resolveUnsaved()) return exportBackup();
+  });
+  on("#import-backup", "click", importBackup);
+  on("#open-data-folder", "click", () => window.clinicDesktop?.openDataFolder?.());
+  $("#view-printing").addEventListener("input", (event) => {
+    if (event.target.matches("input")) markDirty("settings");
+  });
   $("#print-profiles").addEventListener("input", (event) => {
     const card = event.target.closest(".profile-card"); if (!card) return;
     const x = Number($("[data-profile-field='offsetX']", card)?.value) || 0;
     const y = Number($("[data-profile-field='offsetY']", card)?.value) || 0;
-    const dot = $(".offset-dot", card); if (dot) { dot.style.setProperty("--offset-x", `${Math.max(-20, Math.min(20, x)) * 2}px`); dot.style.setProperty("--offset-y", `${Math.max(-20, Math.min(20, y)) * 2}px`); }
+    const dot = $(".offset-dot", card);
+    if (dot) { dot.style.setProperty("--offset-x", Math.max(-20, Math.min(20, x)) * 2 + "px"); dot.style.setProperty("--offset-y", Math.max(-20, Math.min(20, y)) * 2 + "px"); }
   });
-  $("#close-print-preview").addEventListener("click", () => $("#print-dialog").close());
-  $("#print-now").addEventListener("click", printNow);
+  on("#close-print-preview", "click", () => $("#print-dialog").close());
+  on("#print-now", "click", printNow);
   document.addEventListener("keydown", (event) => {
-    if (event.key === "F2") { event.preventDefault(); switchView("billing"); }
-    if (event.key === "F3") { event.preventDefault(); switchView("history"); }
-    if (event.key === "F4") { event.preventDefault(); switchView("catalog"); }
-    if (event.key === "F5") { event.preventDefault(); switchView("printing"); }
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); if (currentView === "billing") saveDraft(); else if (currentView === "printing") savePrintSettings(); }
+    if (operationPromise) { if (["F2","F3","F4","F5","s","S"].includes(event.key)) event.preventDefault(); return; }
+    if ($("dialog[open]")) return;
+    const view = { F2: "billing", F3: "history", F4: "catalog", F5: "printing" }[event.key];
+    if (view) { event.preventDefault(); void runExclusive(() => navigateView(view)); }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      if (currentView === "billing") void runExclusive(saveDraft);
+      else if (currentView === "printing") void runExclusive(savePrintSettings);
+    }
   });
 }
 
@@ -920,24 +1211,63 @@ function updateClock() {
 
 async function initialize() {
   await loadStore();
-  store.catalogItems ||= [];
-  store.documents ||= [];
-  store.printProfiles ||= defaultProfiles();
-  store.settings ||= { organizationName: "门诊部", documentTitle: "门诊项目明细清单", defaultPrintProfileId: store.printProfiles[0]?.id };
   const blankProfile = store.printProfiles.find((profile) => profile.id === "blank-241x140");
   if (blankProfile && blankProfile.paperWidthMm === 241 && blankProfile.paperHeightMm === 140
     && blankProfile.marginsMm?.left === 8 && blankProfile.marginsMm?.right === 8
     && blankProfile.marginsMm?.top === 6 && blankProfile.marginsMm?.bottom === 6) {
     blankProfile.marginsMm = { top: 0, right: 15.5, bottom: 0, left: 15.5 };
   }
-  currentDocument = createFreshDocument();
+  dirtyAreas.clear(); lineEdits.clear(); historyPage = 1;
+  window.clinicDesktop?.setDirty?.(false).catch(() => {});
   bindEvents();
-  updateClock(); setInterval(updateClock, 30_000);
-  await loadPrinterOptions();
-  renderBilling(); renderCatalog(); renderHistory(); renderLocalSettings(); renderPrintProfiles();
+  updateClock();
+  if (!clockTimer) clockTimer = setInterval(updateClock, 30_000);
+  $("#recovery-screen").hidden = true;
+  $(".app-shell").hidden = false;
+  $$("dialog[open]").forEach((dialog) => dialog.close());
+  selectDocument(createFreshDocument());
+  renderCatalog(); renderHistory(); renderLocalSettings(); renderPrintProfiles();
+  switchView("billing"); updateCapacity();
+  document.body.dataset.appReady = "true";
+  void loadPrinterOptions();
 }
 
-initialize().catch((error) => {
+function showRecovery(error) {
   console.error(error);
-  document.body.innerHTML = `<main style="padding:40px;font-family:serif"><h1>收费台启动失败</h1><p>${escapeHtml(error?.message || "未知错误")}</p><p>请重新启动应用；本机数据不会因此删除。</p></main>`;
+  document.body.dataset.appReady = "false";
+  $(".app-shell").hidden = true;
+  $("#recovery-screen").hidden = false;
+  $("#recovery-error").textContent = error?.message || "无法读取本机数据，原文件已保留。";
+  if (window.clinicDesktop?.getStorageInfo) {
+    window.clinicDesktop.getStorageInfo().then((info) => {
+      $("#restore-previous").disabled = !info.previousBackupAvailable;
+      $("#recovery-data-path").textContent = info.dataPath;
+    }).catch(() => {});
+  }
+}
+
+async function recoverFromFile() {
+  try {
+    if (await importBackup()) return;
+  } catch (error) { $("#recovery-error").textContent = error.message; }
+}
+
+$("#recovery-import").addEventListener("click", () => void runExclusive(recoverFromFile));
+$("#recovery-folder").addEventListener("click", () => void runExclusive(() => window.clinicDesktop?.openDataFolder?.()));
+$("#recovery-retry").addEventListener("click", () => void runExclusive(() => initialize().catch(showRecovery)));
+$("#restore-previous").addEventListener("click", () => void runExclusive(async () => {
+  if (!window.confirm("恢复本机上一份自动副本？故障文件会另行保留。")) return false;
+  try { await window.clinicDesktop.restorePreviousBackup(); await initialize(); showToast("已恢复上一份自动副本"); }
+  catch (error) { $("#recovery-error").textContent = error.message; }
+}));
+
+window.clinicDesktop?.onCloseRequest?.(async () => {
+  if (operationPromise) await operationPromise;
+  const close = await runExclusive(() => resolveUnsaved());
+  await window.clinicDesktop.respondClose({ action: close ? "close" : "cancel" });
 });
+window.addEventListener("beforeunload", (event) => {
+  if (!window.clinicDesktop && dirtyAreas.size) { event.preventDefault(); event.returnValue = ""; }
+});
+
+initialize().catch(showRecovery);
