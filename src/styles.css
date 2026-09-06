@@ -337,7 +337,7 @@ input:disabled, select:disabled, textarea:disabled { color: #5f625c; background:
 
 @media print {
   @page { margin: 0; }
-  body { min-width: 0; background: #fff; }
+  html, body { min-width: 0; min-height: 0; margin: 0; background: #fff; }
   body > :not(#print-dialog), .print-preview-toolbar, #print-warning { display: none !important; }
   .print-modal[open] { position: static; display: block; width: auto; height: auto; max-height: none; margin: 0; padding: 0; border: 0; overflow: visible; }
   .print-modal::backdrop { display: none; }
